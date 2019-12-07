@@ -32,7 +32,7 @@ before_script:
 
 script:
   - go test -coverprofile=coverage.txt -run TestLibp2pQuicTransport -ginkgo.v -ginkgo.randomizeAllSpecs -ginkgo.trace -ginkgo.progress
-  - go test -v -run TestLibp2pTransportSuite
+  - QUIC_GO_LOG_LEVEL=debug go test -v -run TestLibp2pTransportSuite
 
 after_success:
   - if [ $TRAVIS_OS_NAME == "linux" ]; then
