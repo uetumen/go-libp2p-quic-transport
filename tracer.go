@@ -4,32 +4,140 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-quic-transport/metrics"
 
 	"github.com/lucas-clemente/quic-go/logging"
-	"github.com/lucas-clemente/quic-go/metrics"
 	"github.com/lucas-clemente/quic-go/qlog"
 )
 
-var tracer logging.Tracer
+type quicTracer struct {
+	node peer.ID
+}
+
+func newQuicTracer(peerID peer.ID) logging.Tracer {
+	return &quicTracer{node: peerID}
+}
+
+var _ logging.Tracer = &quicTracer{}
+
+func (t *quicTracer) TracerForConnection(p logging.Perspective, odcid logging.ConnectionID) logging.ConnectionTracer {
+	return newConnectionTracer(p, odcid, t.node)
+}
+func (t *quicTracer) SentPacket(net.Addr, *logging.Header, logging.ByteCount, []logging.Frame) {}
+func (t *quicTracer) DroppedPacket(net.Addr, logging.PacketType, logging.ByteCount, logging.PacketDropReason) {
+}
+
+type quicConnectionTracer struct {
+	metrics.ConnectionStats
+}
+
+func newConnectionTracer(pers logging.Perspective, odcid logging.ConnectionID, node peer.ID) *quicConnectionTracer {
+	t := &quicConnectionTracer{}
+	t.ConnectionStats.ODCID = odcid
+	t.ConnectionStats.Node = node
+	t.ConnectionStats.Perspective = pers
+	return t
+}
+
+func (t *quicConnectionTracer) StartedConnection(local, remote net.Addr, version logging.VersionNumber, srcConnID, destConnID logging.ConnectionID) {
+	t.ConnectionStats.StartTime = time.Now()
+	t.ConnectionStats.LocalAddr = local
+	t.ConnectionStats.RemoteAddr = remote
+	t.ConnectionStats.Version = version
+}
+
+func (t *quicConnectionTracer) ClosedConnection(r logging.CloseReason) {
+	t.ConnectionStats.CloseReason = r
+	t.ConnectionStats.EndTime = time.Now()
+}
+func (t *quicConnectionTracer) SentTransportParameters(*logging.TransportParameters)     {}
+func (t *quicConnectionTracer) ReceivedTransportParameters(*logging.TransportParameters) {}
+func (t *quicConnectionTracer) SentPacket(hdr *logging.ExtendedHeader, size logging.ByteCount, ack *logging.AckFrame, frames []logging.Frame) {
+	t.ConnectionStats.PacketsSent++
+}
+
+func (t *quicConnectionTracer) ReceivedVersionNegotiationPacket(_ *logging.Header, v []logging.VersionNumber) {
+	t.ConnectionStats.PacketsRcvd++
+	t.ConnectionStats.VersionNegotiationVersions = v
+}
+
+func (t *quicConnectionTracer) ReceivedRetry(*logging.Header) {
+	t.ConnectionStats.PacketsRcvd++
+	t.ConnectionStats.RetryRcvd = true
+}
+
+func (t *quicConnectionTracer) ReceivedPacket(hdr *logging.ExtendedHeader, size logging.ByteCount, frames []logging.Frame) {
+	t.ConnectionStats.PacketsRcvd++
+}
+
+func (t *quicConnectionTracer) BufferedPacket(logging.PacketType) {
+	t.ConnectionStats.PacketsBuffered++
+}
+
+func (t *quicConnectionTracer) DroppedPacket(logging.PacketType, logging.ByteCount, logging.PacketDropReason) {
+	t.ConnectionStats.PacketsDropped++
+}
+
+func (t *quicConnectionTracer) UpdatedMetrics(rttStats *logging.RTTStats, cwnd, bytesInFlight logging.ByteCount, packetsInFlight int) {
+	t.ConnectionStats.LastRTT = metrics.RTTMeasurement{
+		SmoothedRTT: rttStats.SmoothedRTT(),
+		RTTVar:      rttStats.MeanDeviation(),
+		MinRTT:      rttStats.MinRTT(),
+	}
+}
+
+func (t *quicConnectionTracer) LostPacket(logging.EncryptionLevel, logging.PacketNumber, logging.PacketLossReason) {
+	t.ConnectionStats.PacketsLost++
+}
+
+func (t *quicConnectionTracer) UpdatedCongestionState(logging.CongestionState) {}
+func (t *quicConnectionTracer) UpdatedPTOCount(value uint32) {
+	if value > 0 {
+		t.ConnectionStats.PTOCount++
+	}
+}
+func (t *quicConnectionTracer) UpdatedKeyFromTLS(l logging.EncryptionLevel, p logging.Perspective) {
+	if l == logging.Encryption1RTT && p == logging.PerspectiveClient {
+		t.ConnectionStats.HandshakeCompleteTime = time.Now()
+		t.ConnectionStats.HandshakeRTT = t.ConnectionStats.LastRTT
+	}
+}
+func (t *quicConnectionTracer) UpdatedKey(generation logging.KeyPhase, remote bool)                {}
+func (t *quicConnectionTracer) DroppedEncryptionLevel(logging.EncryptionLevel)                     {}
+func (t *quicConnectionTracer) DroppedKey(generation logging.KeyPhase)                             {}
+func (t *quicConnectionTracer) SetLossTimer(logging.TimerType, logging.EncryptionLevel, time.Time) {}
+func (t *quicConnectionTracer) LossTimerExpired(logging.TimerType, logging.EncryptionLevel)        {}
+func (t *quicConnectionTracer) LossTimerCanceled()                                                 {}
+
+// Close is called when the connection is closed.
+func (t *quicConnectionTracer) Close() {
+	if err := t.ConnectionStats.Save(); err != nil {
+		log.Errorf("Saving connection statistics failed: %s", err)
+	}
+}
+
+func (t *quicConnectionTracer) Debug(name, msg string) {}
+
+var _ logging.ConnectionTracer = &quicConnectionTracer{}
+
+var qlogTracer logging.Tracer
 
 func init() {
-	tracers := []logging.Tracer{metrics.NewTracer()}
 	if qlogDir := os.Getenv("QLOGDIR"); len(qlogDir) > 0 {
-		if qlogger := initQlogger(qlogDir); qlogger != nil {
-			tracers = append(tracers, qlogger)
-		}
+		qlogTracer = initQlogger(qlogDir)
 	}
-	tracer = logging.NewMultiplexedTracer(tracers...)
 }
 
 func initQlogger(qlogDir string) logging.Tracer {
 	return qlog.NewTracer(func(role logging.Perspective, connID []byte) io.WriteCloser {
 		// create the QLOGDIR, if it doesn't exist
-		if err := os.MkdirAll(qlogDir, 0777); err != nil {
+		if err := os.MkdirAll(qlogDir, 0o777); err != nil {
 			log.Errorf("creating the QLOGDIR failed: %s", err)
 			return nil
 		}
